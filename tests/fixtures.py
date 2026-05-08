@@ -131,3 +131,4 @@ def generate_noisy_variant(
     noisy_edge_map[pepper_coords_y, pepper_coords_x] = 0
 
     return noisy_edge_map
+#sakshi is amazing
