@@ -243,12 +243,23 @@ def _compute_coarse_transform(
     cad_edge_map: np.ndarray,
     real_edge_map: np.ndarray,
 ) -> Optional[np.ndarray]:
-    cad_descriptor = _extract_primary_contour(cad_edge_map)
+    # ── Downsample both maps for the coarse search (4x fewer pixels → ~4x faster) ──
+    COARSE_SCALE = 0.5
+    h_full, w_full = real_edge_map.shape
+    h_small = max(1, int(h_full * COARSE_SCALE))
+    w_small = max(1, int(w_full * COARSE_SCALE))
+
+    cad_small  = cv2.resize(cad_edge_map,  (w_small, h_small), interpolation=cv2.INTER_AREA)
+    real_small = cv2.resize(real_edge_map, (w_small, h_small), interpolation=cv2.INTER_AREA)
+    _, cad_small  = cv2.threshold(cad_small,  20, 255, cv2.THRESH_BINARY)
+    _, real_small = cv2.threshold(real_small, 20, 255, cv2.THRESH_BINARY)
+
+    cad_descriptor = _extract_primary_contour(cad_small)
     if cad_descriptor is None:
         logger.warning("No valid contour found in CAD edge map, cannot compute coarse transform")
         return None
 
-    real_descriptor = _extract_primary_contour(real_edge_map)
+    real_descriptor = _extract_primary_contour(real_small)
     if real_descriptor is None:
         logger.warning("No valid contour found in real edge map, cannot compute coarse transform")
         return None
@@ -267,21 +278,29 @@ def _compute_coarse_transform(
         f"real_pca={real_descriptor.pca_angle_deg:.1f}°"
     )
 
-    scale_band = [0.90, 0.93, 0.96, 1.00, 1.04, 1.07, 1.10]
+    scale_band = [0.90, 0.95, 1.00, 1.05, 1.10]
 
     best_score, best_M = -1.0, np.eye(3, dtype=np.float64)
 
-    real_filled = _fill_silhouette(real_edge_map)
+    real_filled = _fill_silhouette(real_small)
 
-    coarse_step = 5
-    coarse_angles = [a for a in range(0, 360, coarse_step)]
+    # Wider coarse step (10°) — fine pass corrects the residual
+    coarse_step = 10
+    coarse_angles = list(range(0, 360, coarse_step))
     pca_diff = real_descriptor.pca_angle_deg - cad_descriptor.pca_angle_deg
     coarse_angles = list(set(coarse_angles + [
         round(pca_diff) % 360,
         round(pca_diff + 180) % 360,
     ]))
 
+    EARLY_EXIT_SCORE = 0.88   # stop searching if we already have a great fit
+
+    best_angle_coarse, best_sf_coarse = coarse_angles[0], scale_band[0]
+
+    outer_done = False
     for sf in scale_band:
+        if outer_done:
+            break
         s = base_scale * sf
         for angle in coarse_angles:
             M = _build_affine_matrix(
@@ -290,7 +309,7 @@ def _compute_coarse_transform(
                 src_centroid=cad_descriptor.centroid,
                 dst_centroid=real_descriptor.centroid,
             )
-            warped = apply_transform(cad_edge_map, M, output_shape=real_edge_map.shape)
+            warped = apply_transform(cad_small, M, output_shape=real_small.shape)
             cad_filled = _fill_silhouette(warped)
             intersection = np.logical_and(cad_filled > 0, real_filled > 0).sum()
             union        = np.logical_or(cad_filled  > 0, real_filled > 0).sum()
@@ -298,13 +317,17 @@ def _compute_coarse_transform(
             if score > best_score:
                 best_score, best_M = score, M
                 best_angle_coarse, best_sf_coarse = angle, sf
+            if best_score >= EARLY_EXIT_SCORE:
+                outer_done = True
+                break
 
-    fine_angles = [
-        best_angle_coarse + d
-        for d in range(-coarse_step, coarse_step + 1)
-    ]
-    fine_angles += [pca_diff + d for d in range(-coarse_step, coarse_step + 1)]
-    fine_angles += [pca_diff + 180 + d for d in range(-coarse_step, coarse_step + 1)]
+    # Fine angular refinement (±coarse_step around best, 1° steps)
+    fine_angles = list(range(best_angle_coarse - coarse_step,
+                             best_angle_coarse + coarse_step + 1))
+    fine_angles += list(range(int(pca_diff) - coarse_step,
+                              int(pca_diff) + coarse_step + 1))
+    fine_angles += list(range(int(pca_diff + 180) - coarse_step,
+                              int(pca_diff + 180) + coarse_step + 1))
     fine_angles = list(set(fine_angles))
 
     for sf in [best_sf_coarse - 0.03, best_sf_coarse, best_sf_coarse + 0.03]:
@@ -316,7 +339,7 @@ def _compute_coarse_transform(
                 src_centroid=cad_descriptor.centroid,
                 dst_centroid=real_descriptor.centroid,
             )
-            warped = apply_transform(cad_edge_map, M, output_shape=real_edge_map.shape)
+            warped = apply_transform(cad_small, M, output_shape=real_small.shape)
             cad_filled = _fill_silhouette(warped)
             intersection = np.logical_and(cad_filled > 0, real_filled > 0).sum()
             union        = np.logical_or(cad_filled  > 0, real_filled > 0).sum()
@@ -325,7 +348,19 @@ def _compute_coarse_transform(
                 best_score, best_M = score, M
 
     logger.debug(f"Coarse best score={best_score:.4f}")
-    return best_M
+
+    # ── Scale the matrix back up to full resolution ───────────────────────────
+    # The matrix was computed on the downsampled space; we need to map it back.
+    # S_up @ M_small @ S_down  where S = diag(1/COARSE_SCALE, 1/COARSE_SCALE, 1)
+    S_down = np.array([[COARSE_SCALE, 0, 0],
+                        [0, COARSE_SCALE, 0],
+                        [0, 0,            1]], dtype=np.float64)
+    S_up   = np.array([[1/COARSE_SCALE, 0, 0],
+                        [0, 1/COARSE_SCALE, 0],
+                        [0, 0,              1]], dtype=np.float64)
+    best_M_full = S_up @ best_M @ S_down
+
+    return best_M_full
 
 
 def _detect_and_match_features(
@@ -503,13 +538,17 @@ def align(
         output_shape=real_edge_map.shape
     )
 
-    alignment_score = _compute_alignment_score(aligned_image, real_edge_map)
-
+    # Compute filled silhouettes once and reuse for both score and coverage
     cad_filled  = _fill_silhouette(aligned_image)
     real_filled = _fill_silhouette(real_edge_map)
-    real_area   = int((real_filled > 0).sum())
-    covered     = int(np.logical_and(cad_filled > 0, real_filled > 0).sum())
-    coverage    = float(covered) / float(real_area) if real_area > 0 else 0.0
+
+    intersection = np.logical_and(cad_filled > 0, real_filled > 0).sum()
+    union        = np.logical_or(cad_filled  > 0, real_filled > 0).sum()
+    alignment_score = float(intersection) / float(union) if union > 0 else 0.0
+
+    real_area = int((real_filled > 0).sum())
+    covered   = int(intersection)
+    coverage  = float(covered) / float(real_area) if real_area > 0 else 0.0
 
     high_confidence = alignment_score >= HIGH_CONFIDENCE_THRESHOLD
     identified      = coverage >= COVERAGE_THRESHOLD
